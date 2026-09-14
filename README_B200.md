@@ -6,14 +6,15 @@ tokenizer-specific: Qwen `13 task × 100` và Llama `13 task × 100` ở 131072
 token. Dữ liệu và model đều được đọc local; các script chạy với chế độ
 HuggingFace offline.
 
-Repo này cũng có một đường Query-Robust reference cho Qwen3. Nó lấy nguyên
+Repo này cũng có một đường Query-Robust cho Qwen3. Nó lấy nguyên
 logic QR từ `ihbkaiser/ihb-sparse`: mỗi page có `landmark`, `bias`, và chứng
 nhận `epsilon`; lúc decode page được xếp hạng theo
 `scale * q·landmark + bias + alpha * epsilon`. Vertex asset Qwen3 M32 đã được
 đóng gói ở `source/ShadowKV/artifacts/query_robust/qwen3_4b_128k/` và được
 kiểm tra shape, BF16, fingerprint, metadata, padding, và SHA-256 trước khi
-dùng. Đây là PyTorch correctness/reference path, chưa phải claim throughput
-Triton của repo nguồn.
+dùng. Decode scorer có backend Triton fused bảo toàn top-k/invalid-page
+semantics; summary solver vẫn giữ FP32 canonical và có backend `compile` được
+parity-test với eager.
 
 Wheelhouse hiện dành cho Linux `x86_64` + Python 3.12 và có PyTorch `2.11.0`
 CUDA 12.8; `flash-attn` được giữ dạng source để compile đúng trên B200.
@@ -78,7 +79,36 @@ PYTHONPATH="$PWD" python tools/validate_query_robust.py
 python -m pytest tests/test_query_robust.py -q
 ```
 
-## 4. Chạy campaign Qwen3
+## 4. Preflight benchmark QR
+
+Sau khi `prepare_b200.sh` hoàn tất, chạy một prompt Qwen3 RULER để lấy latency
+decode, latency summary update, HBM peak và throughput:
+
+```bash
+QUERY_ROBUST_ROUTER_BACKEND=triton \
+QUERY_ROBUST_SUMMARY_BACKEND=compile \
+./benchmark_qr_b200.sh
+```
+
+Script này dùng `--runtime_out` của harness và bật CUDA-event instrumentation.
+Đây là preflight trên máy B200; các số đo RTX 3090/4090 không được dùng làm
+claim B200.
+
+Muốn so sánh canonical eager/reference trên cùng máy:
+
+```bash
+QUERY_ROBUST_ROUTER_BACKEND=torch \
+QUERY_ROBUST_SUMMARY_BACKEND=eager \
+./benchmark_qr_b200.sh
+```
+
+QR mặc định giữ exact K/V trên HBM B200. Có thể chạy thêm protocol CPU/UVA:
+
+```bash
+QUERY_ROBUST_OFFLOAD=1 ./benchmark_qr_b200.sh
+```
+
+## 5. Chạy campaign Qwen3
 
 ```bash
 METHODS=quest_streaming,shadowkv_cpu \
@@ -94,7 +124,8 @@ MODEL_NAME=qwen3 METHODS=query_robust \
   ./run_b200_ruler.sh
 ```
 
-Mặc định QR giữ K/V trên GPU B200. Nếu muốn dùng exact K/V pinned CPU và UVA:
+Mặc định QR giữ K/V trên GPU B200, router `auto` và summary `compile`. Nếu muốn
+dùng exact K/V pinned CPU và UVA:
 
 ```bash
 QUERY_ROBUST_OFFLOAD=1 MODEL_NAME=qwen3 METHODS=query_robust \
@@ -104,6 +135,10 @@ QUERY_ROBUST_OFFLOAD=1 MODEL_NAME=qwen3 METHODS=query_robust \
 Muốn chạy ShadowKV GPU-resident nguyên bản trên bộ nhớ lớn của B200, dùng
 `METHODS=quest_streaming,shadowkv`; `shadowkv_cpu` ở lệnh mặc định giữ đúng
 protocol offload đã dùng cho các máy 24 GiB.
+
+Quest được GPU-resident mặc định trên B200. Nếu đặt `QUEST_OFFLOAD=1`, runner
+tự động đặt `QUEST_DENSE_LAYERS=0` vì dense leading layers không tương thích
+với CPU-offloaded KV.
 
 Chạy DeepSeek-R1-Distill-Llama-8B với bộ RULER Llama tương ứng:
 
@@ -123,7 +158,7 @@ Mỗi method được load model một lần và chạy đủ 13 task × 100 m�
 - ShadowKV: `shadowkv_cpu`, rank `160`, chunk `4`, outlier chunks `96`;
 - Quest dùng exact streaming K/V pinned CPU để giữ protocol ổn định.
 
-## 5. Kiểm tra dữ liệu
+## 6. Kiểm tra dữ liệu
 
 ```bash
 ./verify_bundle.sh

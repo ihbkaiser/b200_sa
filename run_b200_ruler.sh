@@ -44,6 +44,20 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 export QUEST_PREFIX_TOKENS=${QUEST_PREFIX_TOKENS:-32}
 export STREAMING_RECENT_TOKENS=${STREAMING_RECENT_TOKENS:-256}
 export STREAMING_UPDATE_INTERVAL=${STREAMING_UPDATE_INTERVAL:-256}
+export QUERY_ROBUST_ROUTER_BACKEND=${QUERY_ROBUST_ROUTER_BACKEND:-auto}
+export QUERY_ROBUST_SUMMARY_BACKEND=${QUERY_ROBUST_SUMMARY_BACKEND:-compile}
+export SHADOWKV_RUNTIME_TIMINGS=${SHADOWKV_RUNTIME_TIMINGS:-0}
+
+QUEST_OFFLOAD=${QUEST_OFFLOAD:-0}
+QUEST_DENSE_LAYERS=${QUEST_DENSE_LAYERS:-2}
+QUEST_OFFLOAD_ARGS=()
+if [ "$QUEST_OFFLOAD" = 1 ]; then
+  if [ "$QUEST_DENSE_LAYERS" -ne 0 ]; then
+    echo "[run] QUEST_OFFLOAD=1 forces QUEST_DENSE_LAYERS=0" >&2
+    QUEST_DENSE_LAYERS=0
+  fi
+  QUEST_OFFLOAD_ARGS=(--streaming_offload --streaming_gather_backend auto)
+fi
 
 mkdir -p "$RESULTS"
 echo "[run] model   : $MODEL"
@@ -63,13 +77,12 @@ run_quest() {
     --num_samples 100 \
     --sparse_budget 4096 \
     --page_size 8 \
-    --dense_layers 2 \
+    --dense_layers "$QUEST_DENSE_LAYERS" \
     --group_reduce max \
     --quest_prefix_tokens "$QUEST_PREFIX_TOKENS" \
     --streaming_recent_tokens "$STREAMING_RECENT_TOKENS" \
     --streaming_update_interval "$STREAMING_UPDATE_INTERVAL" \
-    --streaming_offload \
-    --streaming_gather_backend auto \
+    "${QUEST_OFFLOAD_ARGS[@]}" \
     --out_root "$RESULTS/quest_streaming"
 }
 
