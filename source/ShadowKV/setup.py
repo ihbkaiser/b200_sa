@@ -48,7 +48,19 @@ setup(
             ],
             extra_compile_args={
                 'cxx': ['-std=c++17'],
-                'nvcc': ['-std=c++17', '--expt-relaxed-constexpr', '-lcuda', '-lcudart'],
+                'nvcc': [
+                    '-std=c++17',
+                    '--expt-relaxed-constexpr',
+                    '-lcuda',
+                    '-lcudart',
+                    # The vendored CUTLASS host adapter uses versioned
+                    # PFN_* aliases when available.  CUDA 13.0 headers used
+                    # with the PyTorch cu130 wheel do not expose those aliases
+                    # consistently, while the direct driver prototypes are
+                    # available.  This keeps the native B200 build portable
+                    # across the toolkit and wheel header sets.
+                    '-DCUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL',
+                ],
             },
         )
     ],
