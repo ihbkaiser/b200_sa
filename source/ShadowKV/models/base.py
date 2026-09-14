@@ -29,6 +29,7 @@ from .tensor_op import sample_token, layer_norm, minference_prefill_kernel
 from .kv_cache import KV_Cache, ShadowKVCache, ShadowKVCache_CPU
 from .streaming_cache import StreamingBlockCache
 from .quest_streaming_cache import StreamingQuestCache
+from .query_robust_cache import StreamingQueryRobustCache
 from .retroinfer_streaming_cache import StreamingRetroInferReferenceCache
 from .adaptive_centroid_streaming_cache import StreamingAdaptiveCentroidLSECache
 from .exact_block_streaming_cache import StreamingExactBlockOracleCache
@@ -79,6 +80,16 @@ class LLM:
                       streaming_max_components: int = None,
                       streaming_compact_metadata: bool = False,
                       streaming_center_bits: int = 16,
+                      query_robust_vertices_path: str = None,
+                      query_robust_model_fingerprint: str = None,
+                      query_robust_rope_config: object = None,
+                      query_robust_vertices_sha256: str = None,
+                      query_robust_num_vertices: int = 32,
+                      query_robust_solver_iters: int = 24,
+                      query_robust_solver_lr: float = 0.25,
+                      query_robust_score_alpha: float = 1.0,
+                      query_robust_uniform_p: bool = False,
+                      query_robust_summary_page_batch: int = None,
                       retroinfer_prefix_tokens: int = 4,
                       retroinfer_recent_tokens: int = 64,
                       retroinfer_update_segment: int = 1024,
@@ -105,6 +116,38 @@ class LLM:
                 update_interval=streaming_update_interval,
                 offload=streaming_offload,
                 offload_backend=streaming_gather_backend,
+            )
+        elif self.attn_mode.lower() in {'query_robust', 'qr'}:
+            if query_robust_vertices_path is None:
+                raise ValueError(
+                    "query_robust requires --query_robust_vertices_path"
+                )
+            self.kv_cache = StreamingQueryRobustCache(
+                config,
+                max_length=self.max_length,
+                device=self.device,
+                dtype=self.dtype,
+                batch_size=self.batch_size,
+                sparse_budget=sparse_budget,
+                block_size=page_size,
+                dense_layers=dense_layers,
+                group_reduce=group_reduce,
+                prefix_tokens=quest_prefix_tokens,
+                recent_tokens=quest_recent_tokens,
+                update_interval=streaming_update_interval,
+                offload=streaming_offload,
+                offload_backend=streaming_gather_backend,
+                vertices_path=query_robust_vertices_path,
+                model_id=getattr(self, 'model_name', None),
+                model_fingerprint=query_robust_model_fingerprint,
+                rope_config=query_robust_rope_config,
+                vertices_sha256=query_robust_vertices_sha256,
+                num_vertices=query_robust_num_vertices,
+                solver_iters=query_robust_solver_iters,
+                solver_lr=query_robust_solver_lr,
+                score_alpha=query_robust_score_alpha,
+                uniform_p=query_robust_uniform_p,
+                summary_page_batch=query_robust_summary_page_batch,
             )
         elif self.attn_mode.lower() in {
             'exact_block_lse_streaming', 'exact_block_max_streaming',

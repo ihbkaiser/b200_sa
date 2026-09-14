@@ -15,24 +15,49 @@
 #
 ################################################################################
 
-from .glm import GLM
-from .llama import Llama
-from .qwen import Qwen2
-from .qwen3 import Qwen3
-from .phi3 import Phi3
+"""Model registry with lazy imports for optional CUDA-backed components.
+
+Artifact validators and CPU reference tests should be able to import a small
+router module without first loading the ShadowKV CUDA extension.  The public
+class names remain available through module-level lazy attribute resolution.
+"""
+
+from importlib import import_module
+
+
+_MODEL_MODULES = {
+    "GLM": ".glm",
+    "Llama": ".llama",
+    "Qwen2": ".qwen",
+    "Qwen3": ".qwen3",
+    "Phi3": ".phi3",
+}
+
+
+def __getattr__(name):
+    module_name = _MODEL_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(name)
+    value = getattr(import_module(module_name, __name__), name)
+    globals()[name] = value
+    return value
 
 # model_type -> wrapper. Checked before the substring heuristics below, because
 # a local checkpoint directory is named by whoever downloaded it: a path such as
 # /storage/.../qwen3-4b-instruct-2507 matches 'qwen' and would silently land on
 # the Qwen2 wrapper, which computes the wrong head_dim for Qwen3.
 MODEL_TYPE_TO_CLASS = {
-    'llama': Llama,
-    'qwen2': Qwen2,
-    'qwen3': Qwen3,
-    'phi3': Phi3,
-    'chatglm': GLM,
-    'glm': GLM,
+    'llama': 'Llama',
+    'qwen2': 'Qwen2',
+    'qwen3': 'Qwen3',
+    'phi3': 'Phi3',
+    'chatglm': 'GLM',
+    'glm': 'GLM',
 }
+
+
+def _resolve_model_class(name):
+    return globals().get(name) or getattr(__import__(__name__, fromlist=[name]), name)
 
 def choose_model_class(model_name):
     try:
@@ -41,17 +66,17 @@ def choose_model_class(model_name):
     except Exception:
         model_type = None
     if model_type in MODEL_TYPE_TO_CLASS:
-        return MODEL_TYPE_TO_CLASS[model_type]
+        return _resolve_model_class(MODEL_TYPE_TO_CLASS[model_type])
 
     if 'llama' in model_name.lower():
-        return Llama
+        return _resolve_model_class('Llama')
     elif 'glm' in model_name.lower():
-        return GLM
+        return _resolve_model_class('GLM')
     elif 'yi' in model_name.lower():
-        return Llama
+        return _resolve_model_class('Llama')
     elif 'qwen' in model_name.lower():
-        return Qwen2
+        return _resolve_model_class('Qwen2')
     elif 'phi' in model_name.lower():
-        return Phi3
+        return _resolve_model_class('Phi3')
     else:
         raise ValueError(f"Model {model_name} not found")

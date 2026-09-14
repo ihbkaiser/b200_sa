@@ -1,0 +1,28 @@
+{
+  "artifact": "qwen3_4b_qr_vertices_m32_128k.pt",
+  "source_repository": "https://github.com/ihbkaiser/ihb-sparse",
+  "source_branch": "query-robust-paper-b200",
+  "source_path": "remote_artifacts/modal_20260913_145407_qwen3_qr_128k_final/qwen3_4b_qr_vertices_m32_128k.pt",
+  "sha256": "189b839536e53dac532b032504311b803438d0a968a5aed1db90223f0e76fd68",
+  "bytes": 2363797,
+  "model_id": "Qwen/Qwen3-4B-Instruct-2507",
+  "model_revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+  "shape": [36, 8, 32, 128],
+  "dtype": "torch.bfloat16",
+  "tp_world_size": 1,
+  "calibration": {
+    "dataset": "monology/pile-uncopyrighted",
+    "dataset_revision": "3be90335b66f24456a5d6659d9c8d208c0357114",
+    "sequences": 20,
+    "sequence_length": 131072,
+    "samples_per_query_head": 3000,
+    "vertices": 32,
+    "rope_theta": 5000000.0
+  },
+  "solver": {
+    "iterations": 24,
+    "lr": 0.25,
+    "score_alpha": 1.0
+  },
+  "scope": "Frozen calibration metadata only; no RULER quality claim."
+}

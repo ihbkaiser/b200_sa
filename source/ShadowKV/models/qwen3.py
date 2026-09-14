@@ -18,6 +18,7 @@
 import torch
 import torch.nn.functional as F
 import gc
+from pathlib import Path
 
 import transformers
 from transformers import Qwen3ForCausalLM, Qwen3Config, AutoTokenizer
@@ -138,6 +139,16 @@ class Qwen3(LLM):
         streaming_max_components=None,
         streaming_compact_metadata=False,
         streaming_center_bits=16,
+        query_robust_vertices_path=None,
+        query_robust_model_fingerprint=None,
+        query_robust_rope_config=None,
+        query_robust_vertices_sha256=None,
+        query_robust_num_vertices=32,
+        query_robust_solver_iters=24,
+        query_robust_solver_lr=0.25,
+        query_robust_score_alpha=1.0,
+        query_robust_uniform_p=False,
+        query_robust_summary_page_batch=None,
         retroinfer_prefix_tokens=4,
         retroinfer_recent_tokens=64,
         retroinfer_update_segment=1024,
@@ -177,6 +188,25 @@ class Qwen3(LLM):
         self.ctx_template = Templates['qwen']
         self.chat_template = Chat_Templates['qwen']
 
+        if self.attn_mode.lower() in {'query_robust', 'qr'}:
+            artifact_root = Path(__file__).resolve().parents[1] / 'artifacts' / 'query_robust' / 'qwen3_4b_128k'
+            if query_robust_vertices_path is None:
+                query_robust_vertices_path = str(
+                    artifact_root / 'qwen3_4b_qr_vertices_m32_128k.pt'
+                )
+                query_robust_model_fingerprint = (
+                    query_robust_model_fingerprint
+                    or 'cdbee75f17c01a7cc42f958dc650907174af0554'
+                )
+                query_robust_vertices_sha256 = (
+                    query_robust_vertices_sha256
+                    or '189b839536e53dac532b032504311b803438d0a968a5aed1db90223f0e76fd68'
+                )
+            query_robust_rope_config = query_robust_rope_config or {
+                'rope_theta': float(self.config.rope_theta),
+                'rope_type': 'default',
+            }
+
         self.init_kv_cache(sparse_budget, rank, chunk_size, self.config,
                            page_size=page_size, dense_layers=dense_layers, group_reduce=group_reduce,
                            quest_prefix_tokens=quest_prefix_tokens, quest_recent_tokens=quest_recent_tokens,
@@ -205,6 +235,16 @@ class Qwen3(LLM):
                            streaming_max_components=streaming_max_components,
                            streaming_compact_metadata=streaming_compact_metadata,
                            streaming_center_bits=streaming_center_bits,
+                           query_robust_vertices_path=query_robust_vertices_path,
+                           query_robust_model_fingerprint=query_robust_model_fingerprint,
+                           query_robust_rope_config=query_robust_rope_config,
+                           query_robust_vertices_sha256=query_robust_vertices_sha256,
+                           query_robust_num_vertices=query_robust_num_vertices,
+                           query_robust_solver_iters=query_robust_solver_iters,
+                           query_robust_solver_lr=query_robust_solver_lr,
+                           query_robust_score_alpha=query_robust_score_alpha,
+                           query_robust_uniform_p=query_robust_uniform_p,
+                           query_robust_summary_page_batch=query_robust_summary_page_batch,
                            retroinfer_prefix_tokens=retroinfer_prefix_tokens,
                            retroinfer_recent_tokens=retroinfer_recent_tokens,
                            retroinfer_update_segment=retroinfer_update_segment,

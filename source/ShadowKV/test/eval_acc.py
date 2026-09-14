@@ -130,6 +130,19 @@ def parse_args() -> Namespace:
     p.set_defaults(streaming_compact_metadata=None)
     p.add_argument("--streaming_center_bits", type=int, choices=[4, 8, 16], default=None,
                    help="per-center symmetric quantization precision")
+    p.add_argument("--query_robust_vertices_path", type=str, default=None,
+                   help="Qwen3 Query-Robust BF16 vertex asset")
+    p.add_argument("--query_robust_model_fingerprint", type=str, default=None,
+                   help="checkpoint fingerprint expected by the QR asset")
+    p.add_argument("--query_robust_vertices_sha256", type=str, default=None,
+                   help="SHA-256 expected for the QR vertex asset")
+    p.add_argument("--query_robust_num_vertices", type=int, default=32)
+    p.add_argument("--query_robust_solver_iters", type=int, default=24)
+    p.add_argument("--query_robust_solver_lr", type=float, default=0.25)
+    p.add_argument("--query_robust_score_alpha", type=float, default=1.0)
+    p.add_argument("--query_robust_uniform_p", action="store_true")
+    p.add_argument("--query_robust_summary_page_batch", type=int, default=None,
+                   help="number of pages summarized per PyTorch QR build batch")
     p.add_argument("--retroinfer_prefix_tokens", type=int, default=4,
                    help="RetroInfer reference: exact leading tokens")
     p.add_argument("--retroinfer_recent_tokens", type=int, default=64,
@@ -493,6 +506,7 @@ if __name__ == '__main__':
                       minference=minference)
     if args.method.lower() in {
         'quest_streaming',
+        'query_robust', 'qr',
         'exact_block_lse_streaming', 'exact_block_max_streaming',
         'exact_block_lse_softmax_streaming',
         'exact_block_max_softmax_streaming',
@@ -502,10 +516,22 @@ if __name__ == '__main__':
                           quest_prefix_tokens=args.quest_prefix_tokens,
                           quest_recent_tokens=args.streaming_recent_tokens,
                           streaming_update_interval=args.streaming_update_interval)
-    if args.method.lower() == 'quest_streaming':
+    if args.method.lower() in {'quest_streaming', 'query_robust', 'qr'}:
         llm_kwargs.update(
             streaming_offload=args.streaming_offload,
             streaming_gather_backend=args.streaming_gather_backend,
+        )
+    if args.method.lower() in {'query_robust', 'qr'}:
+        llm_kwargs.update(
+            query_robust_vertices_path=args.query_robust_vertices_path,
+            query_robust_model_fingerprint=args.query_robust_model_fingerprint,
+            query_robust_vertices_sha256=args.query_robust_vertices_sha256,
+            query_robust_num_vertices=args.query_robust_num_vertices,
+            query_robust_solver_iters=args.query_robust_solver_iters,
+            query_robust_solver_lr=args.query_robust_solver_lr,
+            query_robust_score_alpha=args.query_robust_score_alpha,
+            query_robust_uniform_p=args.query_robust_uniform_p,
+            query_robust_summary_page_batch=args.query_robust_summary_page_batch,
         )
     if args.method.lower().startswith('exact_block_'):
         # Exact controls share the streaming refinement implementation with

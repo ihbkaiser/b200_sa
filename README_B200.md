@@ -1,10 +1,19 @@
-# ShadowKV + Quest / Qwen3 + DeepSeek-R1-Distill-Llama-8B / RULER 128K
+# ShadowKV + Quest + Query-Robust / Qwen3 + DeepSeek-R1-Distill-Llama-8B / RULER 128K
 
 Bundle này gồm model Qwen3-4B-Instruct-2507, DeepSeek-R1-Distill-Llama-8B,
 source ShadowKV có Qwen3 + Quest, CUTLASS v3.5.1, và hai bộ RULER
 tokenizer-specific: Qwen `13 task × 100` và Llama `13 task × 100` ở 131072
 token. Dữ liệu và model đều được đọc local; các script chạy với chế độ
 HuggingFace offline.
+
+Repo này cũng có một đường Query-Robust reference cho Qwen3. Nó lấy nguyên
+logic QR từ `ihbkaiser/ihb-sparse`: mỗi page có `landmark`, `bias`, và chứng
+nhận `epsilon`; lúc decode page được xếp hạng theo
+`scale * q·landmark + bias + alpha * epsilon`. Vertex asset Qwen3 M32 đã được
+đóng gói ở `source/ShadowKV/artifacts/query_robust/qwen3_4b_128k/` và được
+kiểm tra shape, BF16, fingerprint, metadata, padding, và SHA-256 trước khi
+dùng. Đây là PyTorch correctness/reference path, chưa phải claim throughput
+Triton của repo nguồn.
 
 Wheelhouse hiện dành cho Linux `x86_64` + Python 3.12 và có PyTorch `2.11.0`
 CUDA 12.8; `flash-attn` được giữ dạng source để compile đúng trên B200.
@@ -61,11 +70,34 @@ Lệnh trên giả định Python của máy là 3.12. Nếu khác phiên bản 
 ./smoke_b200.sh
 ```
 
+Kiểm tra QR vertex asset mà không cần model weights hoặc mạng:
+
+```bash
+cd source/ShadowKV
+PYTHONPATH="$PWD" python tools/validate_query_robust.py
+python -m pytest tests/test_query_robust.py -q
+```
+
 ## 4. Chạy campaign Qwen3
 
 ```bash
 METHODS=quest_streaming,shadowkv_cpu \
   RESULTS_ROOT="$PWD/results/qwen3_128k_100" \
+  ./run_b200_ruler.sh
+```
+
+Chạy riêng Query-Robust trên Qwen3:
+
+```bash
+MODEL_NAME=qwen3 METHODS=query_robust \
+  RESULTS_ROOT="$PWD/results/qwen3_qr_128k_100" \
+  ./run_b200_ruler.sh
+```
+
+Mặc định QR giữ K/V trên GPU B200. Nếu muốn dùng exact K/V pinned CPU và UVA:
+
+```bash
+QUERY_ROBUST_OFFLOAD=1 MODEL_NAME=qwen3 METHODS=query_robust \
   ./run_b200_ruler.sh
 ```
 

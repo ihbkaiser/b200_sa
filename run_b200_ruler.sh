@@ -19,7 +19,8 @@ MODEL=${MODEL_PATH:-$MODEL_DEFAULT}
 DATA=${SHADOWKV_RULER_DATA_ROOT:-$ROOT/source/ShadowKV/data/ruler/data}
 RESULTS=${RESULTS_ROOT:-$ROOT/results/qwen3_128k_100}
 GPU=${CUDA_VISIBLE_DEVICES:-0}
-METHODS=${METHODS:-quest_streaming,shadowkv_cpu}
+METHODS=${METHODS:-quest_streaming,query_robust,shadowkv_cpu}
+QR_ASSET=${QUERY_ROBUST_VERTICES_PATH:-$ROOT/source/ShadowKV/artifacts/query_robust/qwen3_4b_128k/qwen3_4b_qr_vertices_m32_128k.pt}
 
 TASKS="ruler/niah_single_1,ruler/niah_single_2,ruler/niah_single_3,ruler/niah_multikey_1,ruler/niah_multikey_2,ruler/niah_multikey_3,ruler/niah_multivalue,ruler/niah_multiquery,ruler/vt,ruler/cwe,ruler/fwe,ruler/qa_1,ruler/qa_2"
 
@@ -72,6 +73,43 @@ run_quest() {
     --out_root "$RESULTS/quest_streaming"
 }
 
+run_query_robust() {
+  [ "$MODEL_DIR" = qwen ] || {
+    echo "query_robust is calibrated only for Qwen3-4B-Instruct-2507" >&2
+    exit 2
+  }
+  [ -f "$QR_ASSET" ] || {
+    echo "Query-Robust vertex asset not found: $QR_ASSET" >&2
+    exit 2
+  }
+  QR_OFFLOAD_ARGS=()
+  if [ "${QUERY_ROBUST_OFFLOAD:-0}" = 1 ]; then
+    QR_OFFLOAD_ARGS=(--streaming_offload --streaming_gather_backend auto)
+  fi
+  CUDA_VISIBLE_DEVICES="$GPU" "$PY" "$ROOT/source/ShadowKV/test/eval_acc.py" \
+    --model_name "$MODEL" \
+    --datalen 131072 \
+    --method query_robust \
+    --dataset_name "$TASKS" \
+    --num_samples 100 \
+    --sparse_budget 4096 \
+    --page_size 8 \
+    --dense_layers 0 \
+    --group_reduce max \
+    --quest_prefix_tokens "$QUEST_PREFIX_TOKENS" \
+    --streaming_recent_tokens "$STREAMING_RECENT_TOKENS" \
+    --streaming_update_interval "$STREAMING_UPDATE_INTERVAL" \
+    --query_robust_vertices_path "$QR_ASSET" \
+    --query_robust_model_fingerprint cdbee75f17c01a7cc42f958dc650907174af0554 \
+    --query_robust_vertices_sha256 189b839536e53dac532b032504311b803438d0a968a5aed1db90223f0e76fd68 \
+    --query_robust_num_vertices 32 \
+    --query_robust_solver_iters 24 \
+    --query_robust_solver_lr 0.25 \
+    --query_robust_score_alpha 1.0 \
+    "${QR_OFFLOAD_ARGS[@]}" \
+    --out_root "$RESULTS/query_robust"
+}
+
 run_shadowkv_cpu() {
   CUDA_VISIBLE_DEVICES="$GPU" "$PY" "$ROOT/source/ShadowKV/test/eval_acc.py" \
     --model_name "$MODEL" \
@@ -106,6 +144,7 @@ IFS=',' read -r -a requested_methods <<< "$METHODS"
 for method in "${requested_methods[@]}"; do
   case "$method" in
     quest_streaming) run_quest ;;
+    query_robust|qr) run_query_robust ;;
     shadowkv_cpu) run_shadowkv_cpu ;;
     shadowkv) run_shadowkv_gpu ;;
     *) echo "unsupported method: $method" >&2; exit 2 ;;
