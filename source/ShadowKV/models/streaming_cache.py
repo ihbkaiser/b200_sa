@@ -79,6 +79,14 @@ class StreamingBlockCache(ABC):
         # runtime comparison must be able to switch it off for everybody.
         self.gather_reuse = os.environ.get("STREAMING_GATHER_REUSE", "1") == "1"
         self.reuse_stats = os.environ.get("STREAMING_REUSE_STATS", "0") == "1"
+        self.runtime_timing_enabled = (
+            os.environ.get("SHADOWKV_RUNTIME_TIMINGS", "0") == "1"
+        )
+        self._runtime_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {
+            "router": [],
+            "topk": [],
+            "summary_build": [],
+        }
         self.reused_blocks = 0
         self.fetched_blocks = 0
         self._previous_token_ids = [None] * int(config.num_hidden_layers)
@@ -330,6 +338,49 @@ class StreamingBlockCache(ABC):
             f"{'CPU-pinned/' + self.offload_backend if self.offload else 'GPU'}"
         )
 
+    def _runtime_timed(self, name: str, fn):
+        """Run ``fn`` and optionally retain a CUDA-event interval for it."""
+        if not self.runtime_timing_enabled or self.compute_device.type != "cuda":
+            return fn()
+        events = self._runtime_events.setdefault(name, [])
+        if len(events) >= 4096:
+            return fn()
+        stream = torch.cuda.current_stream(self.compute_device)
+        started = torch.cuda.Event(enable_timing=True)
+        finished = torch.cuda.Event(enable_timing=True)
+        started.record(stream)
+        result = fn()
+        finished.record(stream)
+        events.append((started, finished))
+        return result
+
+    @staticmethod
+    def _runtime_percentile(values: list[float], fraction: float) -> float:
+        ordered = sorted(values)
+        index = round((len(ordered) - 1) * fraction)
+        return float(ordered[index])
+
+    def runtime_stats(self) -> dict[str, object]:
+        """Synchronize retained CUDA events and return bounded timing summaries."""
+        if self.runtime_timing_enabled and self.compute_device.type == "cuda":
+            torch.cuda.synchronize(self.compute_device)
+        stats: dict[str, object] = {
+            "timing_enabled": self.runtime_timing_enabled,
+        }
+        for name, events in self._runtime_events.items():
+            values = [started.elapsed_time(finished) for started, finished in events]
+            stats[f"{name}_count"] = len(values)
+            if values:
+                stats[f"{name}_ms"] = {
+                    "p50": self._runtime_percentile(values, 0.50),
+                    "p95": self._runtime_percentile(values, 0.95),
+                    "max": float(max(values)),
+                    "mean": float(sum(values) / len(values)),
+                }
+            else:
+                stats[f"{name}_ms"] = None
+        return stats
+
     def _report_reuse(self) -> None:
         if not self.fetched_blocks:
             return
@@ -521,10 +572,14 @@ class StreamingBlockCache(ABC):
                 device=self.compute_device,
                 dtype=torch.long,
             )
-        scores = self._score_blocks(
-            layer_idx, query_states, first, last
+        scores = self._runtime_timed(
+            "router",
+            lambda: self._score_blocks(layer_idx, query_states, first, last),
         )
-        relative = torch.topk(scores, k=selected, dim=-1).indices
+        relative = self._runtime_timed(
+            "topk",
+            lambda: torch.topk(scores, k=selected, dim=-1).indices,
+        )
         return relative + first
 
     def get_retrieval_position_ids(

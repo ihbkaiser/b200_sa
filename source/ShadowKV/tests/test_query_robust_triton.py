@@ -5,7 +5,9 @@ import importlib.util
 import pytest
 import torch
 
+import models.query_robust_cache as query_robust_cache_module
 from models.query_robust import score_query_robust_pages_reference
+from models.query_robust_cache import StreamingQueryRobustCache
 from models.query_robust_triton import query_robust_page_scores
 
 
@@ -140,6 +142,45 @@ def test_fused_qr_honors_independent_metadata_strides() -> None:
         alpha=1.25,
     )
     torch.testing.assert_close(fused, reference, atol=2e-2, rtol=2e-2)
+
+
+def test_qr_cache_dispatches_contiguous_cuda_decode_to_triton(monkeypatch) -> None:
+    query, landmark, bias, epsilon, valid = _fixture()
+    cache = StreamingQueryRobustCache.__new__(StreamingQueryRobustCache)
+    cache.batch_size = 1
+    cache.num_attention_heads = 32
+    cache.num_key_value_heads = 8
+    cache.num_key_value_groups = 4
+    cache.head_dim = 128
+    cache.compute_device = query.device
+    cache.group_reduce = "max"
+    cache.incoming_q_len = 1
+    cache.query_robust_scale = 0.08838834764831843
+    cache.score_alpha = 1.0
+    cache.query_robust_router_backend = "triton"
+    cache.landmark_cache = [landmark.permute(1, 0, 2).contiguous()]
+    cache.bias_cache = [bias.transpose(0, 1).contiguous()]
+    cache.epsilon_cache = [epsilon.transpose(0, 1).contiguous()]
+    cache.metadata_valid = [valid.transpose(0, 1).contiguous()]
+
+    called = {"fused": False}
+    real_fused = query_robust_page_scores
+
+    def wrapped_fused(*args, **kwargs):
+        called["fused"] = True
+        return real_fused(*args, **kwargs)
+
+    monkeypatch.setattr(
+        query_robust_cache_module,
+        "query_robust_page_scores",
+        wrapped_fused,
+        raising=False,
+    )
+    query_states = query.view(1, 32, 1, 128)
+    scores = cache._score_blocks(0, query_states, 7, 71)
+
+    assert called["fused"]
+    assert scores.shape == (1, 8, 64)
 
 
 @pytest.mark.parametrize("bad_range", [(0, 0), (10, 4)])

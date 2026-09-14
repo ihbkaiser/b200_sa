@@ -12,6 +12,7 @@ from .query_robust import (
     load_query_robust_asset,
     score_query_robust_pages_reference,
 )
+from .query_robust_triton import query_robust_page_scores
 from .streaming_cache import StreamingBlockCache
 
 
@@ -21,9 +22,9 @@ class StreamingQueryRobustCache(StreamingBlockCache):
     The cache keeps the complete post-RoPE K/V backing store inherited from
     :class:`StreamingBlockCache`.  QR metadata is built only for sealed pages
     that can become retrievable, and the inherited gather then reads exactly
-    the pages selected by the QR score.  This is intentionally a PyTorch
-    reference path; it exposes the algorithm without claiming a fused-kernel
-    performance result.
+    the pages selected by the QR score.  Decode routing uses the fused Triton
+    scorer when requested and supported, while retaining the PyTorch reference
+    scorer as an explicit and automatic fallback.
     """
 
     def __init__(
@@ -52,6 +53,15 @@ class StreamingQueryRobustCache(StreamingBlockCache):
         self.solver_lr = float(solver_lr)
         self.score_alpha = float(score_alpha)
         self.uniform_p = bool(uniform_p)
+        self.query_robust_router_backend = os.environ.get(
+            "QUERY_ROBUST_ROUTER_BACKEND", "auto"
+        ).lower()
+        if self.query_robust_router_backend not in {"auto", "triton", "torch"}:
+            raise ValueError(
+                "QUERY_ROBUST_ROUTER_BACKEND must be auto, triton, or torch"
+            )
+        self.query_robust_router_backend_used = "torch"
+        self.query_robust_router_fallback = None
         self.summary_page_batch = int(
             summary_page_batch
             if summary_page_batch is not None
@@ -141,13 +151,16 @@ class StreamingQueryRobustCache(StreamingBlockCache):
             chunk_ids = ids[start:stop]
             # [B,H,P,S,D] -> [P,S,H,D], the QR summary contract.
             keys = blocks[:, :, start:stop].squeeze(0).permute(1, 2, 0, 3).contiguous()
-            summary = build_query_robust_page_summaries(
-                keys,
-                vertices,
-                scale=self.query_robust_scale,
-                solver_iters=self.solver_iters,
-                solver_lr=self.solver_lr,
-                uniform_p=self.uniform_p,
+            summary = self._runtime_timed(
+                "summary_build",
+                lambda: build_query_robust_page_summaries(
+                    keys,
+                    vertices,
+                    scale=self.query_robust_scale,
+                    solver_iters=self.solver_iters,
+                    solver_lr=self.solver_lr,
+                    uniform_p=self.uniform_p,
+                ),
             )
             self.landmark_cache[layer_idx].index_copy_(
                 1, chunk_ids, summary.landmark.transpose(0, 1)
@@ -183,22 +196,68 @@ class StreamingQueryRobustCache(StreamingBlockCache):
             self.num_attention_heads,
             self.head_dim,
         )
-        slots = torch.arange(
-            first_block,
-            last_block,
-            device=self.compute_device,
-            dtype=torch.int32,
-        ).view(1, -1)
-        page_scores = score_query_robust_pages_reference(
-            query,
-            self.landmark_cache[layer_idx].transpose(0, 1),
-            self.bias_cache[layer_idx].transpose(0, 1),
-            self.epsilon_cache[layer_idx].transpose(0, 1),
-            self.metadata_valid[layer_idx].transpose(0, 1),
-            slots,
-            scale=self.query_robust_scale,
-            alpha=self.score_alpha,
+        landmark = self.landmark_cache[layer_idx].transpose(0, 1)
+        bias = self.bias_cache[layer_idx].transpose(0, 1)
+        epsilon = self.epsilon_cache[layer_idx].transpose(0, 1)
+        metadata_valid = self.metadata_valid[layer_idx].transpose(0, 1)
+        use_triton = (
+            query.is_cuda
+            and self.query_robust_router_backend in {"auto", "triton"}
         )
+        if use_triton:
+            try:
+                page_scores = query_robust_page_scores(
+                    query,
+                    landmark,
+                    bias,
+                    epsilon,
+                    metadata_valid,
+                    first_page=first_block,
+                    last_page=last_block,
+                    scale=self.query_robust_scale,
+                    alpha=self.score_alpha,
+                )
+                self.query_robust_router_backend_used = "triton"
+                self.query_robust_router_fallback = None
+            except Exception as error:
+                if self.query_robust_router_backend == "triton":
+                    raise
+                self.query_robust_router_backend_used = "torch"
+                self.query_robust_router_fallback = type(error).__name__
+                slots = torch.arange(
+                    first_block,
+                    last_block,
+                    device=self.compute_device,
+                    dtype=torch.int32,
+                ).view(1, -1)
+                page_scores = score_query_robust_pages_reference(
+                    query,
+                    landmark,
+                    bias,
+                    epsilon,
+                    metadata_valid,
+                    slots,
+                    scale=self.query_robust_scale,
+                    alpha=self.score_alpha,
+                )
+        else:
+            slots = torch.arange(
+                first_block,
+                last_block,
+                device=self.compute_device,
+                dtype=torch.int32,
+            ).view(1, -1)
+            page_scores = score_query_robust_pages_reference(
+                query,
+                landmark,
+                bias,
+                epsilon,
+                metadata_valid,
+                slots,
+                scale=self.query_robust_scale,
+                alpha=self.score_alpha,
+            )
+            self.query_robust_router_backend_used = "torch"
         # QR's reference scorer intentionally chooses one page order per
         # request.  The shared cache interface expects one score per KV head,
         # so broadcast that order without introducing head-specific branches.
@@ -210,10 +269,25 @@ class StreamingQueryRobustCache(StreamingBlockCache):
         super().print_stats()
         valid = int(self.metadata_valid.sum().item())
         print(
-            "QUERY_ROBUST_REFERENCE | "
+            "QUERY_ROBUST | "
+            f"router={self.query_robust_router_backend_used} "
             f"vertices={self.num_vertices} solver_iters={self.solver_iters} "
             f"alpha={self.score_alpha:g} valid_page_heads={valid}"
         )
+
+    def qr_runtime_stats(self) -> dict[str, object]:
+        stats = self.runtime_stats()
+        stats.update(
+            {
+                "router_backend_requested": self.query_robust_router_backend,
+                "router_backend_used": self.query_robust_router_backend_used,
+                "router_fallback": self.query_robust_router_fallback,
+                "solver_iters": self.solver_iters,
+                "solver_lr": self.solver_lr,
+                "score_alpha": self.score_alpha,
+            }
+        )
+        return stats
 
     @torch.no_grad()
     def query_robust_duality_gap_stats(self) -> dict[str, float | int]:
