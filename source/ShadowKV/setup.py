@@ -19,6 +19,7 @@
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from cuda_build import get_cuda_include_dirs
 import shutil
 import os
 
@@ -42,7 +43,8 @@ setup(
                 f'{current_dir}/3rdparty/cutlass/include',
                 f'{current_dir}/3rdparty/cutlass/examples/common',
                 f'{current_dir}/3rdparty/cutlass/tools/util/include',
-                f'{current_dir}/kernels'
+                f'{current_dir}/kernels',
+                *map(str, get_cuda_include_dirs()),
             ],
             extra_compile_args={
                 'cxx': ['-std=c++17'],
