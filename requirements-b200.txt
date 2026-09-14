@@ -1,0 +1,5 @@
+# Run from the artifact root. Install a B200-compatible PyTorch first; it is
+# intentionally not pinned here because the correct wheel depends on the host's
+# Python/CUDA combination.
+-r source/ShadowKV/requirements-research.txt
+einops==0.8.1

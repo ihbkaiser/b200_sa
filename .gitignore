@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.so
+*.o
+build/
+dist/
+*.egg-info/
+
+# Large runtime artifacts live in the Hugging Face bundle.
+model/
+wheels/
+assets/
+*.zip
+
+# Generated benchmark outputs/data are not source code.
+source/ShadowKV/data/ruler/data/
+
+# Do not vendor the dependency's own Git history.
+source/ShadowKV/3rdparty/cutlass/.git/

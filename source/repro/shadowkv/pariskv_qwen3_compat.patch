@@ -1,0 +1,31 @@
+diff --git a/model_hub/qwen.py b/model_hub/qwen.py
+index 944abd3..38e512c 100644
+--- a/model_hub/qwen.py
++++ b/model_hub/qwen.py
+@@ -136,7 +136,7 @@ class QwenModel(LLM):
+         if self.device_map != 'auto':
+             hf_qwen = AutoModelForCausalLM.from_pretrained(
+                 self.model_name, 
+-                dtype=self.dtype, 
++                torch_dtype=self.dtype, 
+                 trust_remote_code=True,
+                 low_cpu_mem_usage=True,
+                 device_map=self.device_map,
+@@ -145,7 +145,7 @@ class QwenModel(LLM):
+         else:
+             hf_qwen = AutoModelForCausalLM.from_pretrained(
+                 self.model_name, 
+-                dtype=self.dtype, 
++                torch_dtype=self.dtype, 
+                 trust_remote_code=True,
+                 device_map='auto',
+                 **_extra,
+@@ -295,7 +295,7 @@ class QwenModel(LLM):
+                 "cache_unit_size": polar_config["cache_unit_size"],
+                 "cache_cluster_num": polar_config["cache_cluster_num"],
+                 "num_gpus": self.num_gpus,
+-                "model_size": int(re.search(r'(\d+)[B]', self.model_name).group(1)),
++                "model_size": int(re.search(r'(\d+)b', self.model_name, re.I).group(1)),
+                 "enable_offload": polar_config.get("enable_offload", False),
+                 "dynamic_update_interval": polar_config.get("dynamic_update_interval", 128),
+                 "final_topk": polar_config.get("final_topk", 100),

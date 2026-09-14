@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+# Datasets and results never live in the repo: they are per-machine and reach
+# the code through env vars (see repro/shadowkv/env_m*.sh).
+# ONE exception, repro/shadowkv/data/reasoning/ (332 kB): AIME25/MATH500/GPQA
+# must be byte-identical on every machine or their cells cannot be merged, and
+# the per-machine copies did drift -- see that directory's README.
+# Trailing slash matches a directory only. Each machine links this at its own
+# RULER store, and a committed symlink would carry one machine's absolute path
+# into every checkout -- which is exactly what happened on 2026-09-13.
+ShadowKV/data/ruler
+ShadowKV/data/ruler/
+results*/
+_archive*/

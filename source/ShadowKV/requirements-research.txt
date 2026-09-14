@@ -1,0 +1,32 @@
+# Portable research environment used by Qwen3/Llama ShadowKV campaigns.
+# Install torch and flash-attn separately as documented in ../repro/shadowkv/README.md.
+accelerate==1.14.0
+beautifulsoup4
+datasets==5.0.1
+fuzzywuzzy==0.18.0
+html2text
+huggingface-hub==0.36.2
+jieba==0.42.1
+matplotlib
+ninja==1.13.0
+nltk==3.8.1
+numpy==2.2.6
+packaging==25.0
+pandas==2.3.3
+protobuf==7.36.0
+pyarrow==23.0.0
+pytest==9.1.1
+pyyaml
+rouge==1.0.1
+rouge-score==0.1.2
+safetensors==0.7.0
+scipy==1.15.3
+seaborn
+sentencepiece==0.2.2
+tabulate==0.10.0
+tenacity
+termcolor==3.3.0
+tokenizers==0.21.4
+tqdm==4.67.2
+transformers==4.55.4
+wonderwords==3.0.1

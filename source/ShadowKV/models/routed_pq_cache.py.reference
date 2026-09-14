@@ -1,0 +1,429 @@
+################################################################################
+#
+# M51 -- Routed Multi-Anchor PQ LSE Retrieval, end to end.
+#
+# The probe this comes from (repro/certified_sparse/probe_routed_tangent_m51.py)
+# measures one layer and one KV head on captured tensors. This runs the same
+# selection rule inside the model, on every layer and head, so it can be scored
+# on RULER next to Quest and ShadowKV.
+#
+# THE RULE
+# --------
+# Blocks of `leaf_size` post-RoPE keys. For each anchor u_m, the block's
+# log-sum-exp mass F_G(u) = logsumexp_{k in G} (u . k) is linearised at u_m:
+#
+#     g_{G,m} = grad F_G(u_m) = sum_k softmax_k(u_m . k) * k     <- weighted centroid
+#     a_{G,m} = F_G(u_m) - u_m . g_{G,m}
+#
+# A query is routed to its nearest anchor, the tangent is read for that branch
+# only, and the block's score is
+#
+#     U_G = a_{G,m*} + q . PQ(g_{G,m*}) + eta_{G,m*,r}
+#
+# Blocks are then loaded in descending U until the predicted unresolved mass
+# falls below 1 - coverage; loaded blocks contribute their EXACT logits, so the
+# approximation decides only WHICH blocks are read, never the arithmetic on
+# them.
+#
+# WHAT IS OFFLINE AND WHAT IS PER CONTEXT
+# ---------------------------------------
+#   offline, once per (layer, kv head)   anchors, calibration queries
+#   per context, in prefill              tangents, PQ codebook, envelope eta
+#   per decode step                      route, PQ table, scan, load, attend
+#
+# Anchors and calibration queries live in query space and come from a bank
+# captured on OTHER prompts, so no part of the eval context is used to fit
+# them. The envelope has to be per context because it is indexed per block.
+#
+# TWO DELIBERATE DEPARTURES FROM THE PROBE, both of which make the number worse
+# rather than better, and neither of which is optional in a real model:
+#
+#   1. GQA. The probe scores one query at a time and reports its traffic. In a
+#      real model the query heads of a GQA group share one KV cache, so the
+#      loads of a group have to be unioned. Group-union traffic is reported
+#      alongside per-query traffic; the union is what a deployment pays.
+#   2. This class computes the selection exactly and then applies it as a mask
+#      over the full logits. That yields the method's exact output, and its
+#      traffic is counted honestly, but its DECODE WALL CLOCK IS NOT THE
+#      METHOD'S -- it is an upper bound that still touches every key. Decode
+#      cost for M51 must be read from the traffic columns, not from seconds.
+#      (The same caveat applies to our unfused Quest: measured wall clock said
+#      it was slower than dense while reading 13x less.)
+#
+################################################################################
+
+import math
+
+import torch
+
+from .compat import head_dim_of
+
+
+def _batched_kmeans(x, n_codes, iters=12, seed=0):
+    """k-means over a batch of independent problems.
+
+    x: [B, N, D] -> codebook [B, n_codes, D], codes [B, N] (int64)
+    Deterministic: centres start from a strided slice, so a rerun of the same
+    context reproduces the same codebook.
+    """
+    B, N, D = x.shape
+    step = max(1, N // n_codes)
+    centres = x[:, ::step, :][:, :n_codes, :].clone()
+    if centres.shape[1] < n_codes:                       # pad by repetition
+        pad = n_codes - centres.shape[1]
+        centres = torch.cat([centres, centres[:, :pad]], dim=1)
+
+    codes = torch.zeros(B, N, dtype=torch.long, device=x.device)
+    for _ in range(iters):
+        # [B, N, n_codes]
+        d = torch.cdist(x, centres)
+        codes = d.argmin(dim=-1)
+        onehot = torch.zeros(B, N, n_codes, device=x.device, dtype=x.dtype)
+        onehot.scatter_(2, codes.unsqueeze(-1), 1.0)
+        counts = onehot.sum(dim=1)                        # [B, n_codes]
+        summed = torch.einsum('bnc,bnd->bcd', onehot, x)
+        nonempty = counts > 0
+        new = torch.where(nonempty.unsqueeze(-1), summed / counts.clamp(min=1).unsqueeze(-1), centres)
+        if torch.allclose(new, centres, rtol=0, atol=1e-7):
+            centres = new
+            break
+        centres = new
+    d = torch.cdist(x, centres)
+    codes = d.argmin(dim=-1)
+    return centres, codes
+
+
+class RoutedPQCache:
+    """M51 selection over a retained KV cache."""
+
+    def __init__(self,
+        config: object,
+        batch_size: int = 1,
+        max_length: int = 32*1024,
+        device: str = 'cuda:0',
+        dtype = torch.bfloat16,
+        anchors_path: str = None,
+        leaf_size: int = 8,
+        n_anchors: int = 8,
+        pq_subdim: int = 8,
+        pq_codes: int = 64,
+        coverage: float = 0.90,
+        eta_quantile: float = 0.999,
+        dense_layers: int = 0,
+        ) -> None:
+
+        assert batch_size == 1, "RoutedPQCache supports batch_size=1"
+        assert anchors_path, "M51 needs --anchors_path (see repro/shadowkv/m51_fit_anchors.py)"
+
+        self.config = config
+        self.batch_size = batch_size
+        self.max_length = max_length
+        self.device = device
+        self.dtype = dtype
+
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
+        self.head_dim = head_dim_of(config)
+        self.num_layers = config.num_hidden_layers
+
+        self.leaf_size = int(leaf_size)
+        self.n_anchors = int(n_anchors)
+        self.pq_subdim = int(pq_subdim)
+        self.pq_codes = int(pq_codes)
+        self.coverage = float(coverage)
+        self.epsilon = 1.0 - self.coverage
+        self.eta_quantile = float(eta_quantile)
+        self.dense_layers = int(dense_layers)
+        assert self.head_dim % self.pq_subdim == 0
+        self.n_sub = self.head_dim // self.pq_subdim
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+
+        shape = (self.num_layers, batch_size, self.num_key_value_heads, max_length, self.head_dim)
+        self.k_cache = torch.zeros(shape, device=device, dtype=dtype)
+        self.v_cache = torch.zeros(shape, device=device, dtype=dtype)
+
+        self._load_offline(anchors_path)
+
+        self.codes = self.codebook = self.offsets = self.eta = None
+        self.kv_offset = 0
+        self.prefill = 0
+        self.gen_offset = 0
+        self.n_leaves = 0
+        self.tail = 0
+        self.copy_stream = torch.cuda.Stream()
+
+        # traffic accounting, the number that actually matters for M51
+        self.loaded_blocks = 0        # per (query head) sum
+        self.union_blocks = 0         # per KV head after the GQA union
+        self.total_blocks = 0
+        self.n_queries = 0
+        self.prefill_meta_s = 0.0
+
+    def _load_offline(self, path):
+        import numpy as np
+        z = np.load(path)
+        anchors = torch.from_numpy(z["anchors"])          # [L, H, M, D], query-scaled
+        calib = torch.from_numpy(z["calib"])              # [L, H, G, N, D], query-scaled
+        assert anchors.shape[0] == self.num_layers, \
+            f"anchor bank has {anchors.shape[0]} layers, model has {self.num_layers}"
+        assert anchors.shape[1] == self.num_key_value_heads
+        assert anchors.shape[3] == self.head_dim
+        if anchors.shape[2] < self.n_anchors:
+            raise ValueError(f"bank holds {anchors.shape[2]} anchors, asked for {self.n_anchors}")
+        self.anchors = anchors[:, :, :self.n_anchors].to(self.device, torch.float32)
+        self.calib = calib.to(self.device, torch.float32)
+        self.n_calib = self.calib.shape[3]
+
+    # -- bookkeeping ------------------------------------------------------
+
+    def print_stats(self):
+        print(f"M51 routed-PQ | leaf {self.leaf_size} | anchors {self.n_anchors} | "
+              f"PQ {self.n_sub}x{self.pq_codes}(subdim {self.pq_subdim}) | "
+              f"coverage {self.coverage} | eta q{self.eta_quantile} | "
+              f"calib {self.n_calib}/group | dense layers {self.dense_layers}")
+
+    def get_kv_len(self):
+        return self.kv_offset
+
+    def H2D(self):
+        pass
+
+    def is_dense_layer(self, layer_idx):
+        return layer_idx < self.dense_layers
+
+    def traffic(self):
+        """Byte accounting, in the probe's units so the numbers line up.
+
+        A block of KV costs leaf_size * head_dim * 4 bytes (K and V, 2 bytes
+        each). Against that:
+          * scan      -- one PQ branch per block: 6-bit codes + offset + eta,
+                         plus the shared codebook amortised over the context;
+          * resident  -- every branch, since all M are stored;
+          * exact     -- the blocks actually pulled, which is the term that
+                         dominates and the one the GQA union inflates.
+        """
+        if not self.n_queries:
+            return {}
+        D, G, M = self.head_dim, self.num_key_value_groups, self.n_anchors
+        block_bytes = self.leaf_size * D * 4
+        code_bytes = self.n_sub * 6 / 8                      # 6 bits per PQ code
+        branch_bytes = code_bytes + 2 + 2                    # + offset + eta (this group)
+        resident_branch_bytes = code_bytes + 2 + 2 * G       # eta is per group
+        shared = self.pq_codes * D * 2 / (self.prefill * 4 * D) if self.prefill else 0.0
+
+        per_query = self.loaded_blocks / max(1, self.n_queries * self.total_blocks)
+        n_kv_queries = max(1, self.n_queries // G)
+        union = self.union_blocks / max(1, n_kv_queries * self.total_blocks)
+        scan = shared + branch_bytes / block_bytes
+        resident = shared + M * resident_branch_bytes / block_bytes
+        return dict(
+            per_query_block_frac=per_query,
+            group_union_block_frac=union,
+            summary_scan_frac=scan,
+            resident_summary_frac=resident,
+            total_traffic_frac=scan + union,
+            prefill_meta_s=self.prefill_meta_s,
+        )
+
+    def clear(self):
+        self.k_cache.zero_()
+        self.v_cache.zero_()
+        self.codes = self.codebook = self.offsets = self.eta = None
+        self.kv_offset = 0
+        self.prefill = 0
+        self.gen_offset = 0
+        self.n_leaves = 0
+        self.tail = 0
+
+    # -- prefill: build the per-context metadata --------------------------
+
+    def prefill_kv_cache(self, new_v_cache, layer_idx, key_states_roped, query=None):
+        import time
+        incoming = new_v_cache.shape[-2]
+        self.prefill = incoming
+        self.k_cache[layer_idx][:, :, :incoming].copy_(key_states_roped)
+        self.v_cache[layer_idx][:, :, :incoming].copy_(new_v_cache)
+
+        H, D, M = self.num_key_value_heads, self.head_dim, self.n_anchors
+        L = incoming // self.leaf_size
+        self.n_leaves = L
+        self.tail = incoming - L * self.leaf_size
+        self.total_blocks = L
+
+        if L < 2:
+            raise ValueError(f"prefill {incoming} gives {L} blocks; too short for M51")
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+        if self.codes is None:
+            self.codes = torch.zeros(self.num_layers, H, M, L, self.n_sub,
+                                     device=self.device, dtype=torch.uint8)
+            self.codebook = torch.zeros(self.num_layers, H, self.n_sub, self.pq_codes,
+                                        self.pq_subdim, device=self.device, dtype=torch.float32)
+            self.offsets = torch.zeros(self.num_layers, H, M, L, device=self.device,
+                                       dtype=torch.float32)
+            self.eta = torch.zeros(self.num_layers, H, M, self.num_key_value_groups, L,
+                                   device=self.device, dtype=torch.float32)
+
+        keys = key_states_roped[0, :, :L * self.leaf_size].to(torch.float32)   # [H, L*ls, D]
+        leaves = keys.view(H, L, self.leaf_size, D)
+        anchors = self.anchors[layer_idx]                                       # [H, M, D]
+
+        # tangents: weighted centroid and offset, per (head, anchor, block)
+        anchor_logits = torch.einsum('hmd,hltd->hmlt', anchors, leaves)
+        weights = torch.softmax(anchor_logits, dim=-1)
+        centers = torch.einsum('hmlt,hltd->hmld', weights, leaves)              # [H, M, L, D]
+        offsets = torch.logsumexp(anchor_logits, dim=-1) \
+            - torch.einsum('hmd,hmld->hml', anchors, centers)
+        self.offsets[layer_idx].copy_(offsets)
+        del anchor_logits, weights
+
+        # PQ over the tangents; anchors of a head share one codebook, as in the probe
+        flat = centers.reshape(H, M * L, D)
+        recon = torch.empty_like(flat)
+        for s in range(self.n_sub):
+            sl = slice(s * self.pq_subdim, (s + 1) * self.pq_subdim)
+            cb, code = _batched_kmeans(flat[:, :, sl], self.pq_codes)
+            self.codebook[layer_idx, :, s].copy_(cb)
+            self.codes[layer_idx, :, :, :, s].copy_(code.view(H, M, L).to(torch.uint8))
+            recon[:, :, sl] = torch.gather(cb, 1, code.unsqueeze(-1).expand(-1, -1, self.pq_subdim))
+        recon = recon.view(H, M, L, D)
+        del centers, flat
+
+        # envelope: per (head, anchor, query group, block) quantile of the
+        # residual, measured with the offline calibration queries against THIS
+        # context's blocks. This is the 512 x T x d term.
+        G, Nc = self.num_key_value_groups, self.n_calib
+        calib = self.calib[layer_idx]                                           # [H, G, Nc, D]
+        route = torch.cdist(calib.reshape(H, G * Nc, D),
+                            anchors).argmin(dim=-1).view(H, G, Nc)              # [H, G, Nc]
+
+        for h in range(H):
+            logits = calib[h].reshape(G * Nc, D) @ keys[h].T                    # [G*Nc, L*ls]
+            true_mass = torch.logsumexp(logits.view(G * Nc, L, self.leaf_size), dim=-1)
+            true_mass = true_mass.view(G, Nc, L)
+            del logits
+            for m in range(M):
+                lin = offsets[h, m].unsqueeze(0) + calib[h].reshape(G * Nc, D) @ recon[h, m].T
+                err = (true_mass.view(G * Nc, L) - lin).view(G, Nc, L)
+                for g in range(G):
+                    sel = route[h, g] == m
+                    src = err[g][sel] if sel.any() else err[g]     # probe's fallback
+                    self.eta[layer_idx, h, m, g] = torch.quantile(
+                        src.to(torch.float32), self.eta_quantile, dim=0)
+            del true_mass
+
+        torch.cuda.synchronize()
+        self.prefill_meta_s += time.perf_counter() - t0
+
+        if layer_idx == self.num_layers - 1:
+            self.kv_offset += incoming
+
+    # -- decode -----------------------------------------------------------
+
+    def select(self, layer_idx, query_states):
+        """-> (loaded mask [H, G, L], per-leaf exact logits are computed by caller)"""
+        H, D, M, G = self.num_key_value_heads, self.head_dim, self.n_anchors, self.num_key_value_groups
+        L, ls = self.n_leaves, self.leaf_size
+
+        q = query_states.view(H, G, D).to(torch.float32) * self.scale           # pre-scaled
+        anchors = self.anchors[layer_idx]                                       # [H, M, D]
+        route = torch.cdist(q, anchors).argmin(dim=-1)                          # [H, G]
+
+        # PQ lookup table for the routed branch only
+        cb = self.codebook[layer_idx]                                           # [H, S, C, sub]
+        qs = q.view(H, G, self.n_sub, self.pq_subdim)
+        lut = torch.einsum('hgsp,hscp->hgsc', qs, cb)                           # [H, G, S, C]
+
+        idx = route.view(H, G, 1, 1).expand(H, G, L, self.n_sub)
+        codes = self.codes[layer_idx].permute(0, 2, 1, 3)                       # [H, L, M, S]
+        codes = torch.gather(codes.unsqueeze(1).expand(H, G, L, M, self.n_sub), 3,
+                             idx.unsqueeze(3)).squeeze(3).long()                # [H, G, L, S]
+        score = torch.gather(lut.unsqueeze(2).expand(H, G, L, self.n_sub, self.pq_codes),
+                             4, codes.unsqueeze(-1)).squeeze(-1).sum(-1)        # [H, G, L]
+
+        off = torch.gather(self.offsets[layer_idx].unsqueeze(1).expand(H, G, M, L), 2,
+                           route.view(H, G, 1, 1).expand(H, G, 1, L)).squeeze(2)
+        eta = torch.gather(
+            self.eta[layer_idx].permute(0, 2, 1, 3),                            # [H, G, M, L]
+            2, route.view(H, G, 1, 1).expand(H, G, 1, L)).squeeze(2)
+        upper = off + score + eta                                               # [H, G, L]
+
+        # exact per-block mass, from the retained cache
+        keys = self.k_cache[layer_idx][0, :, :L * ls].to(torch.float32)          # [H, L*ls, D]
+        logits = torch.einsum('hgd,hnd->hgn', q, keys)                           # [H, G, L*ls]
+        true_mass = torch.logsumexp(logits.view(H, G, L, ls), dim=-1)            # [H, G, L]
+
+        # the probe's stopping rule, per block, vectorised:
+        # load in descending upper bound until sigmoid(unresolved - retained) <= eps
+        order = torch.argsort(upper, dim=-1, descending=True)
+        mass_sorted = torch.gather(true_mass, -1, order)
+        upper_sorted = torch.gather(upper, -1, order)
+        retained = torch.logcumsumexp(mass_sorted, dim=-1)                       # after k loads
+        rev = torch.flip(torch.logcumsumexp(torch.flip(upper_sorted, [-1]), dim=-1), [-1])
+        unresolved = torch.cat([rev[..., 1:], torch.full_like(rev[..., :1], -float('inf'))], -1)
+        gauge = torch.sigmoid(unresolved - retained)                             # after k loads
+        ok = gauge <= self.epsilon
+        first = torch.where(ok.any(-1), ok.float().argmax(-1), torch.full_like(ok[..., 0].long(), L - 1))
+        k_needed = (first + 1).clamp(min=1, max=L)                               # [H, G]
+
+        rank = torch.empty_like(order)
+        rank.scatter_(-1, order, torch.arange(L, device=order.device).expand_as(order))
+        loaded = rank < k_needed.unsqueeze(-1)                                   # [H, G, L]
+
+        self.loaded_blocks += int(loaded.sum())
+        self.union_blocks += int(loaded.any(dim=1).sum())
+        self.n_queries += H * G
+        return loaded, logits
+
+    def update_kv_cache(self, new_k_cache, new_v_cache, layer_idx):
+        incoming = new_k_cache.shape[-2]
+        start = self.prefill + self.gen_offset
+        self.k_cache[layer_idx][:, :, start:start + incoming].copy_(new_k_cache, non_blocking=True)
+        self.v_cache[layer_idx][:, :, start:start + incoming].copy_(new_v_cache, non_blocking=True)
+        if layer_idx == self.num_layers - 1:
+            self.kv_offset += incoming
+            self.gen_offset += incoming
+
+    # -- attention over the selected blocks -------------------------------
+
+    def _end(self, layer_idx):
+        """Valid cache length for this layer during a decode step.
+
+        update_kv_cache advances kv_offset only on the last layer, so every
+        earlier layer has already written this step's token while the counter
+        still reads one short. Same convention as ShadowKVCache.
+        """
+        return self.kv_offset if layer_idx == self.num_layers - 1 else self.kv_offset + 1
+
+    def attend(self, layer_idx, query_states, loaded=None, logits=None):
+        """Softmax over the loaded blocks plus the always-resident tail.
+
+        The trailing partial block and every generated token are always
+        attended: they are the local window, and the block grid does not cover
+        them. Loaded blocks contribute their exact logits, so selection is the
+        only approximation.
+        """
+        H, G, D = self.num_key_value_heads, self.num_key_value_groups, self.head_dim
+        L, ls = self.n_leaves, self.leaf_size
+        end = self._end(layer_idx)
+        q = query_states.view(H, G, D).to(torch.float32) * self.scale
+
+        if loaded is None:                                   # dense layer
+            keys = self.k_cache[layer_idx][0, :, :end].to(torch.float32)
+            full = torch.einsum('hgd,hnd->hgn', q, keys)
+            p = torch.softmax(full, dim=-1)
+        else:
+            mask = loaded.unsqueeze(-1).expand(H, G, L, ls).reshape(H, G, L * ls)
+            block_logits = logits.masked_fill(~mask, float('-inf'))
+            if end > L * ls:
+                keys_tail = self.k_cache[layer_idx][0, :, L * ls:end].to(torch.float32)
+                tail_logits = torch.einsum('hgd,hnd->hgn', q, keys_tail)
+                block_logits = torch.cat([block_logits, tail_logits], dim=-1)
+            p = torch.softmax(block_logits, dim=-1)
+
+        values = self.v_cache[layer_idx][0, :, :end].to(torch.float32)
+        out = torch.einsum('hgn,hnd->hgd', p, values)
+        return out.view(1, 1, H * G, D).to(self.dtype)
