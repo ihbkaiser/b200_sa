@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 
 from .query_robust import (
+    QueryRobustSummaryWorkspace,
     build_query_robust_page_summaries,
     load_query_robust_asset,
     score_query_robust_pages_reference,
@@ -60,6 +61,13 @@ class StreamingQueryRobustCache(StreamingBlockCache):
             raise ValueError(
                 "QUERY_ROBUST_ROUTER_BACKEND must be auto, triton, or torch"
             )
+        self.query_robust_summary_backend = os.environ.get(
+            "QUERY_ROBUST_SUMMARY_BACKEND", "eager"
+        ).lower()
+        if self.query_robust_summary_backend not in {"eager", "compile"}:
+            raise ValueError(
+                "QUERY_ROBUST_SUMMARY_BACKEND must be eager or compile"
+            )
         self.query_robust_router_backend_used = "torch"
         self.query_robust_router_fallback = None
         self.summary_page_batch = int(
@@ -103,6 +111,9 @@ class StreamingQueryRobustCache(StreamingBlockCache):
         self.query_robust_num_valid_vertices = asset.num_valid_vertices
         self.query_robust_asset_meta = asset.meta
         self.query_robust_scale = float(self.head_dim) ** -0.5
+        self.query_robust_summary_workspace = QueryRobustSummaryWorkspace(
+            self.compute_device, backend=self.query_robust_summary_backend
+        )
         self.landmark_cache = torch.zeros(
             (
                 self.num_layers,
@@ -160,6 +171,7 @@ class StreamingQueryRobustCache(StreamingBlockCache):
                     solver_iters=self.solver_iters,
                     solver_lr=self.solver_lr,
                     uniform_p=self.uniform_p,
+                    workspace=self.query_robust_summary_workspace,
                 ),
             )
             self.landmark_cache[layer_idx].index_copy_(
@@ -282,6 +294,10 @@ class StreamingQueryRobustCache(StreamingBlockCache):
                 "router_backend_requested": self.query_robust_router_backend,
                 "router_backend_used": self.query_robust_router_backend_used,
                 "router_fallback": self.query_robust_router_fallback,
+                "summary_backend_requested": self.query_robust_summary_backend,
+                "summary_backend_used": self.query_robust_summary_workspace.backend_used,
+                "summary_compile_fallback": self.query_robust_summary_workspace.compile_fallback,
+                "summary_workspace_allocations": self.query_robust_summary_workspace.allocation_count,
                 "solver_iters": self.solver_iters,
                 "solver_lr": self.solver_lr,
                 "score_alpha": self.score_alpha,

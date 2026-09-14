@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -369,18 +370,9 @@ def solve_query_robust_page(
     )
 
 
-@torch.no_grad()
-def build_query_robust_page_summaries(
-    keys: torch.Tensor,
-    vertices: torch.Tensor,
-    *,
-    scale: float,
-    solver_iters: int,
-    solver_lr: float,
-    uniform_p: bool,
-) -> QueryRobustSummary:
-    """Build summaries for keys ``[pages, page_size, kv_heads, dim]``."""
-
+def _validate_batched_summary_inputs(
+    keys: torch.Tensor, vertices: torch.Tensor
+) -> tuple[int, int, int, int, int]:
     if keys.ndim != 4 or vertices.ndim != 3:
         raise ValueError(
             "Query-Robust builder expects keys [P, N, H, D] and vertices [H, M, D]."
@@ -392,28 +384,38 @@ def build_query_robust_page_summaries(
         raise ValueError("Query-Robust vertex head dimensions do not match keys.")
     if int(vertices.shape[1]) < 2:
         raise ValueError("Query-Robust builder needs at least two vertices.")
-    flat_keys = keys.float().permute(0, 2, 1, 3).reshape(
-        pages * num_heads, page_size, head_dim
-    )
-    flat_vertices = vertices.float().unsqueeze(0).expand(pages, -1, -1, -1).reshape(
-        pages * num_heads, int(vertices.shape[1]), head_dim
-    )
+    return pages, page_size, num_heads, head_dim, int(vertices.shape[1])
+
+
+def _build_flat_query_robust_summary(
+    flat_keys: torch.Tensor,
+    flat_vertices: torch.Tensor,
+    *,
+    page_size: int,
+    scale: float,
+    solver_iters: int,
+    solver_lr: float,
+    uniform_p: bool,
+) -> tuple[torch.Tensor, ...]:
+    """Tensor-only summary body shared by eager and compiled backends."""
+    pages_heads, _, head_dim = flat_keys.shape
+    vertices = int(flat_vertices.shape[1])
     logits = float(scale) * torch.bmm(flat_vertices, flat_keys.transpose(1, 2))
     page_lse = torch.logsumexp(logits, dim=-1)
     lambda_logits = torch.zeros(
-        pages * num_heads,
-        int(vertices.shape[1]),
+        pages_heads,
+        vertices,
         dtype=torch.float32,
-        device=keys.device,
+        device=flat_keys.device,
     )
     if uniform_p:
         p = torch.full(
-            (pages * num_heads, page_size),
+            (pages_heads, page_size),
             1.0 / float(page_size),
             dtype=torch.float32,
-            device=keys.device,
+            device=flat_keys.device,
         )
-        lam = torch.full_like(lambda_logits, 1.0 / float(vertices.shape[1]))
+        lam = torch.full_like(lambda_logits, 1.0 / float(vertices))
         bar_s = torch.bmm(lam.unsqueeze(1), logits).squeeze(1)
     else:
         for step_index in range(int(solver_iters)):
@@ -432,7 +434,10 @@ def build_query_robust_page_summaries(
     flat_landmark = torch.bmm(p.unsqueeze(1), flat_keys).squeeze(1)
     entropy = (
         torch.full(
-            (pages * num_heads,), math.log(float(page_size)), dtype=torch.float32, device=keys.device
+            (pages_heads,),
+            math.log(float(page_size)),
+            dtype=torch.float32,
+            device=flat_keys.device,
         )
         if uniform_p
         else torch.logsumexp(bar_s, dim=-1) - torch.sum(p * bar_s, dim=-1)
@@ -445,13 +450,221 @@ def build_query_robust_page_summaries(
     )
     epsilon = errors.amax(dim=-1).clamp_min(0.0)
     dual = errors.mean(dim=-1) if uniform_p else torch.sum(lam * errors, dim=-1)
+    gap = epsilon - dual
+    return (
+        flat_landmark.to(torch.bfloat16),
+        entropy.float(),
+        epsilon.float(),
+        dual.float(),
+        gap.float(),
+        errors.float(),
+    )
+
+
+def _summary_from_flat_outputs(
+    outputs: tuple[torch.Tensor, ...],
+    *,
+    pages: int,
+    num_heads: int,
+    head_dim: int,
+    vertices: int,
+) -> QueryRobustSummary:
+    flat_landmark, entropy, epsilon, dual, gap, errors = outputs
     return QueryRobustSummary(
-        landmark=flat_landmark.to(torch.bfloat16).view(pages, num_heads, head_dim),
-        bias=entropy.float().view(pages, num_heads),
-        epsilon=epsilon.float().view(pages, num_heads),
-        dual=dual.float().view(pages, num_heads),
-        gap=(epsilon - dual).float().view(pages, num_heads),
-        errors=errors.float().view(pages, num_heads, int(vertices.shape[1])),
+        landmark=flat_landmark.view(pages, num_heads, head_dim),
+        bias=entropy.view(pages, num_heads),
+        epsilon=epsilon.view(pages, num_heads),
+        dual=dual.view(pages, num_heads),
+        gap=gap.view(pages, num_heads),
+        errors=errors.view(pages, num_heads, vertices),
+    )
+
+
+@lru_cache(maxsize=16)
+def _compiled_summary_builder(
+    pages: int,
+    page_size: int,
+    num_heads: int,
+    head_dim: int,
+    vertices: int,
+    scale: float,
+    solver_iters: int,
+    solver_lr: float,
+    uniform_p: bool,
+):
+    del pages, num_heads, head_dim, vertices
+    if not hasattr(torch, "compile"):
+        raise RuntimeError("this PyTorch version has no torch.compile")
+
+    def compiled(flat_keys: torch.Tensor, flat_vertices: torch.Tensor):
+        return _build_flat_query_robust_summary(
+            flat_keys,
+            flat_vertices,
+            page_size=page_size,
+            scale=scale,
+            solver_iters=solver_iters,
+            solver_lr=solver_lr,
+            uniform_p=uniform_p,
+        )
+
+    return torch.compile(compiled, backend="inductor", dynamic=False)
+
+
+class QueryRobustSummaryWorkspace:
+    """Reusable flattened buffers and optional compiled QR summary body."""
+
+    def __init__(self, device: torch.device | str, *, backend: str = "eager") -> None:
+        self.device = torch.device(device)
+        self.backend = str(backend).lower()
+        if self.backend not in {"eager", "compile"}:
+            raise ValueError("Query-Robust summary backend must be eager or compile")
+        self.backend_used = "eager"
+        self._flat_keys: torch.Tensor | None = None
+        self._flat_vertices: torch.Tensor | None = None
+        self.allocation_count = 0
+        self.compile_fallback: str | None = None
+
+    def _ensure_buffers(
+        self, pages: int, page_size: int, num_heads: int, head_dim: int, vertices: int
+    ) -> None:
+        key_shape = (pages * num_heads, page_size, head_dim)
+        vertex_shape = (pages * num_heads, vertices, head_dim)
+        if self._flat_keys is None or self._flat_keys.shape != key_shape:
+            self._flat_keys = torch.empty(
+                key_shape, device=self.device, dtype=torch.float32
+            )
+            self.allocation_count += 1
+        if self._flat_vertices is None or self._flat_vertices.shape != vertex_shape:
+            self._flat_vertices = torch.empty(
+                vertex_shape, device=self.device, dtype=torch.float32
+            )
+            self.allocation_count += 1
+
+    @torch.no_grad()
+    def build(
+        self,
+        keys: torch.Tensor,
+        vertices: torch.Tensor,
+        *,
+        scale: float,
+        solver_iters: int,
+        solver_lr: float,
+        uniform_p: bool,
+    ) -> QueryRobustSummary:
+        pages, page_size, num_heads, head_dim, num_vertices = (
+            _validate_batched_summary_inputs(keys, vertices)
+        )
+        if keys.device != self.device or vertices.device != self.device:
+            raise ValueError("Query-Robust workspace and inputs must share a device")
+        if not math.isfinite(float(scale)):
+            raise ValueError("Query-Robust attention scale must be finite.")
+        solver_iters = int(solver_iters)
+        solver_lr = float(solver_lr)
+        if solver_iters <= 0 or not math.isfinite(solver_lr) or solver_lr <= 0:
+            raise ValueError("Query-Robust solver_iters and solver_lr must be positive.")
+
+        self._ensure_buffers(pages, page_size, num_heads, head_dim, num_vertices)
+        assert self._flat_keys is not None and self._flat_vertices is not None
+        self._flat_keys.copy_(keys.permute(0, 2, 1, 3).reshape(-1, page_size, head_dim))
+        expanded_vertices = vertices.unsqueeze(0).expand(
+            pages, -1, -1, -1
+        ).reshape(-1, num_vertices, head_dim)
+        self._flat_vertices.copy_(expanded_vertices)
+
+        if self.backend == "compile":
+            try:
+                compiled = _compiled_summary_builder(
+                    pages,
+                    page_size,
+                    num_heads,
+                    head_dim,
+                    num_vertices,
+                    float(scale),
+                    solver_iters,
+                    solver_lr,
+                    bool(uniform_p),
+                )
+                outputs = compiled(self._flat_keys, self._flat_vertices)
+                self.compile_fallback = None
+                self.backend_used = "compile"
+            except Exception as error:
+                self.compile_fallback = type(error).__name__
+                self.backend_used = "eager"
+                outputs = _build_flat_query_robust_summary(
+                    self._flat_keys,
+                    self._flat_vertices,
+                    page_size=page_size,
+                    scale=float(scale),
+                    solver_iters=solver_iters,
+                    solver_lr=solver_lr,
+                    uniform_p=bool(uniform_p),
+                )
+        else:
+            self.backend_used = "eager"
+            outputs = _build_flat_query_robust_summary(
+                self._flat_keys,
+                self._flat_vertices,
+                page_size=page_size,
+                scale=float(scale),
+                solver_iters=solver_iters,
+                solver_lr=solver_lr,
+                uniform_p=bool(uniform_p),
+            )
+        return _summary_from_flat_outputs(
+            outputs,
+            pages=pages,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            vertices=num_vertices,
+        )
+
+
+@torch.no_grad()
+def build_query_robust_page_summaries(
+    keys: torch.Tensor,
+    vertices: torch.Tensor,
+    *,
+    scale: float,
+    solver_iters: int,
+    solver_lr: float,
+    uniform_p: bool,
+    workspace: QueryRobustSummaryWorkspace | None = None,
+) -> QueryRobustSummary:
+    """Build summaries for keys ``[pages, page_size, kv_heads, dim]``."""
+    if workspace is not None:
+        return workspace.build(
+            keys,
+            vertices,
+            scale=scale,
+            solver_iters=solver_iters,
+            solver_lr=solver_lr,
+            uniform_p=uniform_p,
+        )
+    pages, page_size, num_heads, head_dim, num_vertices = (
+        _validate_batched_summary_inputs(keys, vertices)
+    )
+    flat_keys = keys.float().permute(0, 2, 1, 3).reshape(
+        pages * num_heads, page_size, head_dim
+    )
+    flat_vertices = vertices.float().unsqueeze(0).expand(
+        pages, -1, -1, -1
+    ).reshape(
+        pages * num_heads, num_vertices, head_dim
+    )
+    return _summary_from_flat_outputs(
+        _build_flat_query_robust_summary(
+            flat_keys,
+            flat_vertices,
+            page_size=page_size,
+            scale=float(scale),
+            solver_iters=int(solver_iters),
+            solver_lr=float(solver_lr),
+            uniform_p=bool(uniform_p),
+        ),
+        pages=pages,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        vertices=num_vertices,
     )
 
 
@@ -509,6 +722,7 @@ def score_query_robust_pages_reference(
 __all__ = [
     "QueryRobustAsset",
     "QueryRobustSummary",
+    "QueryRobustSummaryWorkspace",
     "build_query_robust_page_summaries",
     "load_query_robust_asset",
     "score_query_robust_pages_reference",
