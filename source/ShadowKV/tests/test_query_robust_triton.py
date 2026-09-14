@@ -107,6 +107,41 @@ def test_fused_qr_preserves_invalid_page_semantics() -> None:
     torch.testing.assert_close(fused[finite], reference[finite], atol=2e-2, rtol=2e-2)
 
 
+def test_fused_qr_honors_independent_metadata_strides() -> None:
+    query, landmark, bias, epsilon, valid = _fixture()
+    first_page, last_page = 5, 69
+    epsilon = torch.rand(
+        epsilon.shape[1], epsilon.shape[0], device=epsilon.device, dtype=epsilon.dtype
+    ).transpose(0, 1)
+    assert not epsilon.is_contiguous()
+    slots = torch.arange(
+        first_page, last_page, device=query.device, dtype=torch.int32
+    ).view(1, -1)
+
+    reference = score_query_robust_pages_reference(
+        query,
+        landmark,
+        bias,
+        epsilon,
+        valid,
+        slots,
+        scale=0.08838834764831843,
+        alpha=1.25,
+    )
+    fused = query_robust_page_scores(
+        query,
+        landmark,
+        bias,
+        epsilon,
+        valid,
+        first_page=first_page,
+        last_page=last_page,
+        scale=0.08838834764831843,
+        alpha=1.25,
+    )
+    torch.testing.assert_close(fused, reference, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("bad_range", [(0, 0), (10, 4)])
 def test_fused_qr_rejects_empty_page_ranges(bad_range: tuple[int, int]) -> None:
     query, landmark, bias, epsilon, valid = _fixture()
@@ -122,4 +157,3 @@ def test_fused_qr_rejects_empty_page_ranges(bad_range: tuple[int, int]) -> None:
             scale=0.125,
             alpha=1.0,
         )
-
